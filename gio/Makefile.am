@@ -167,7 +167,6 @@ application_headers = \
 application_sources = \
 	gapplication.c				\
 	gapplicationcommandline.c		\
-	gapplicationimpl-dbus.c			\
 	gapplicationimpl.h			\
 						\
 	gactiongroup.c				\
@@ -184,6 +183,13 @@ application_sources = \
 	gmenuexporter.c				\
 	gdbusmenumodel.c			\
 	$(NULL)
+
+if OS_CARBON
+AM_CPPFLAGS += -xobjective-c
+application_sources += gapplicationimpl-osx.c
+else
+application_sources += gapplicationimpl-dbus.c
+endif
 
 local_sources = \
 	glocaldirectorymonitor.c 	\
