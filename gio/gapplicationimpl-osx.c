@@ -55,7 +55,7 @@
 - (id)initWithCoder:(NSCoder *)decoder
 {
   self = [super init];
- 
+  
   NSString *typeString;
   const void *bytes;
   NSUInteger lengthp;
@@ -77,12 +77,12 @@
 - (void)encodeWithCoder:(NSCoder *)encoder
 {
   [encoder encodeObject:[[NSString string] initWithCString:g_variant_get_type_string (variant)
-                                           encoding:NSASCIIStringEncoding]];
-   
+                                                  encoding:NSASCIIStringEncoding]];
+  
   [encoder encodeBytes:g_variant_get_data (variant)
                 length:g_variant_get_size (variant)
                 forKey:@"GVariantData"];
-   
+  
 }
 
 - (GVariant *)variant
@@ -94,11 +94,15 @@
 {
   if (variant != NULL)
     g_variant_unref (variant);
-  
-  [super dealloc];
+    
+    [super dealloc];
 }
 @end
 
+
+
+static GApplicationCommandLine *
+g_osx_command_line_new (NSString *service_name, NSArray *argumentsArray, GVariantObject *platformData);
 
 @protocol GAppObjectProtocol
 
@@ -123,11 +127,10 @@ struct _GApplicationImpl
   NSConnection *connection;
   id            appObject;
   
-  id            commandLineObject;
   GMutex        command_line_mutex;
   GCond         command_line_cond;
   int           command_line_ret;
-
+  
   GApplication *app;
   const char   *appid;
 };
@@ -142,62 +145,78 @@ struct _GApplicationImpl
   return self;
 }
 
-static void
-activate_idle_func (GVariant *platform_data)
+typedef struct
 {
-  class->before_emit (impl->app, platform_data);
-  g_signal_emit_by_name (impl->app, "activate");
-  class->after_emit (impl->app, platform_data);
+  GApplication *app;
+  GVariant *platform_data;
+} ActivateData;
+
+static gboolean
+activate_idle_func (ActivateData *data)
+{
+  GApplicationClass *class;
   
-  g_variant_unref (platform_data);
+  class = G_APPLICATION_GET_CLASS (data->app);
   
-  return FALSE;
+  class->before_emit (data->app, data->platform_data);
+  g_signal_emit_by_name (data->app, "activate");
+  class->after_emit (data->app, data->platform_data);
+  
+  g_variant_unref (data->platform_data);
+  g_slice_free (ActivateData, data);
+  
+  return G_SOURCE_REMOVE;
 }
 
 - (void)activate:(GVariantObject *)platformData
 {
-  GApplicationClass *class;
-  GVariant *platform_data;
+  ActivateData *data;
   
-  class = G_APPLICATION_GET_CLASS (impl->app);
+  data = g_slice_new (ActivateData);
+  data->app = impl->app;
+  data->platform_data = g_variant_ref ([platformData variant]);
   
-  platform_data = g_variant_ref ([platformData variant]);
-  g_idle_add (activate_idle_func, platform_data);
+  g_idle_add ((GSourceFunc)activate_idle_func, data);
 }
 
 typedef struct
 {
+  GApplication *app;
   GFile   **files;
+  gint      n_files;
   char     *hint;
   GVariant *platform_data;
 } OpenData;
 
 static gboolean
-open_idle_func (OpenData *open_data)
+open_idle_func (OpenData *data)
 {
-  class->before_emit (impl->app, platform_data);
-  g_signal_emit_by_name (impl->app, "open", files, n,
-                         [hint UTF8String]);
-  class->after_emit (impl->app, platform_data);
+  GApplicationClass *class;
+  gint i;
   
+  class = G_APPLICATION_GET_CLASS (data->app);
   
-  g_free (open_data->hint);
+  class->before_emit (data->app, data->platform_data);
+  g_signal_emit_by_name (data->app, "open", data->files, data->n_files, data->hint);
+  class->after_emit (data->app, data->platform_data);
   
-  for (i = 0; i < n; i++)
-    g_object_unref (open_data->files[i]);
-  g_free (open_data->files);
+  for (i = 0; i < data->n_files; i++)
+    g_object_unref (data->files[i]);
+  g_free (data->files);
   
-  g_variant_unref (open_data->platform_data);
+  g_free (data->hint);
+  g_variant_unref (data->platform_data);
   
-  g_slice_free (OpenData, open_data);
+  g_slice_free (OpenData, data);
   
-  return FALSE;
+  return G_SOURCE_REMOVE;
 }
 
 - (void)openURIS:(NSArray *)uris hint:(NSString *)hint platformData:(GVariantObject *)platformData
 {
   GFile **files;
   NSUInteger n, i;
+  OpenData *data;
   
   n = [uris count];
   files = g_new (GFile *, n + 1);
@@ -211,31 +230,54 @@ open_idle_func (OpenData *open_data)
   }
   files[n] = NULL;
   
-  openData = g_slice_new (OpenData);
-
-  openData->platform_data = g_variant_ref ([platformData variant]);
-  openData->files = files;
-  openData->hint = g_strdup ([hint UTF8String]);
-
-  g_idle_add (open_idle_func, open_data);
+  data = g_slice_new (OpenData);
+  
+  data->app = impl->app;
+  data->platform_data = g_variant_ref ([platformData variant]);
+  data->files = files;
+  data->n_files = n;
+  data->hint = g_strdup ([hint UTF8String]);
+  
+  g_idle_add ((GSourceFunc)open_idle_func, data);
 }
 
 typedef struct
 {
+  GApplication *app;
   GApplicationCommandLine *cmdline;
-}
-- (void)commandLine:(NSString *)serviceName arguments:(NSArray *)arguments platformData:(GVariantObject *)platformData;
-{
   GVariant *platform_data;
-  GApplicationCommandLine *cmdline;
+} CommandLineData;
+
+static gboolean
+command_line_idle_func (CommandLineData *data)
+{
+  GApplicationClass *class;
   int status;
   
-  platform_data = [platformData variant];
-  cmdline = g_osx_command_line_new (serviceName, arguments, platformData);
+  class = G_APPLICATION_GET_CLASS (data->app);
   
-  g_signal_emit_by_name (impl->app, "command-line", cmdline, &status);
-  g_application_command_line_set_exit_status (cmdline, status);
-  class->after_emit (impl->app, platform_data);
+  class->before_emit (data->app, data->platform_data);
+  g_signal_emit_by_name (data->app, "command-line", data->cmdline, &status);
+  g_application_command_line_set_exit_status (data->cmdline, status);
+  class->after_emit (data->app, data->platform_data);
+  
+  g_object_unref (data->cmdline);
+  g_variant_unref (data->platform_data);
+  g_slice_free (CommandLineData, data);
+  
+  return G_SOURCE_REMOVE;
+}
+
+- (void)commandLine:(NSString *)serviceName arguments:(NSArray *)arguments platformData:(GVariantObject *)platformData;
+{
+  CommandLineData *data;
+  
+  data = g_slice_new (CommandLineData);
+  data->app = impl->app;
+  data->cmdline = g_osx_command_line_new (serviceName, arguments, platformData);
+  data->platform_data = [platformData variant];  
+  
+  g_idle_add ((GSourceFunc)command_line_idle_func, data);
 }
 @end
 
@@ -272,7 +314,7 @@ typedef struct
 
 - (void) printError:(NSString *)message
 {
-  g_printerr ("%s", message);
+  g_printerr ("%s", [message UTF8String]);
 }
 
 - (void) setExitStatus:(int32_t)status
@@ -292,9 +334,6 @@ g_application_impl_destroy (GApplicationImpl *impl)
   if (impl->appObject)
     [impl->appObject release];
   
-  if (impl->commandLineObject)
-    [impl->commandLineObject release];
-  
   g_mutex_clear (&impl->command_line_mutex);
   g_cond_clear (&impl->command_line_cond);
   
@@ -311,27 +350,34 @@ g_application_impl_clear (GApplicationImpl **impl)
 static GApplicationImpl *
 g_application_impl_new ()
 {
+  GApplicationImpl *impl;
+  
   impl = g_slice_new0 (GApplicationImpl);
   
   g_mutex_init (&impl->command_line_mutex);
   g_cond_init (&impl->command_line_cond);
+  
+  return impl;
 }
 
 GApplicationImpl *
-g_application_impl_register (GApplication       *application,
-                             const gchar        *appid,
-                             GApplicationFlags   flags,
-                             GActionGroup      **remote_actions,
-                             GCancellable       *cancellable,
-                             GError            **error)
+g_application_impl_register (GApplication        *application,
+                             const gchar         *appid,
+                             GApplicationFlags    flags,
+                             GActionGroup        *exported_actions,
+                             GRemoteActionGroup **remote_actions,
+                             GCancellable        *cancellable,
+                             GError             **error)
 {
   GApplicationImpl *impl;
-  NSAutoReleasePool *pool;
+  NSAutoreleasePool *pool;
+  
+  impl = g_application_impl_new();
   
   impl->app = application;
   impl->appid = appid;
   
-  pool = [NSAutoReleasePool new];
+  pool = [NSAutoreleasePool new];
   
   /* Only try to be the primary instance if
    * G_APPLICATION_IS_LAUNCHER was not specified.
@@ -340,7 +386,7 @@ g_application_impl_register (GApplication       *application,
   {
     NSConnection *connection;
     
-    connection = [[NSConnection new]];
+    connection = [NSConnection new];
     
     if ([connection registerName:[NSString stringWithUTF8String:appid]] == YES)
     {
@@ -357,6 +403,8 @@ g_application_impl_register (GApplication       *application,
       [connection release];
   }
   
+  /* We are non-primary, open connection to primary instance */
+  
   impl->connection = [NSConnection
                       connectionWithRegisteredName:[NSString stringWithUTF8String:appid]
                       host:nil];
@@ -369,14 +417,14 @@ g_application_impl_register (GApplication       *application,
   impl->appObject = [impl->connection rootObject];
   if (impl->appObject == nil)
   {
-    g_application_impl_clear (impl);
+    g_application_impl_clear (&impl);
     goto done;
   }
   
   [impl->appObject setProtocolForProxy:@protocol(GAppObjectProtocol)];
   
   *remote_actions = NULL;
-
+  
 done:
   [pool drain];
   return impl;
@@ -389,8 +437,8 @@ g_application_impl_activate (GApplicationImpl *impl,
   GVariantObject *platformData;
   
   platformData = [[GVariantObject alloc] 
-                   initWithVariant:platform_data];
-    
+                  initWithVariant:platform_data];
+  
   [impl->appObject activate:platformData];
   [platformData release];
 }
@@ -428,7 +476,9 @@ g_application_impl_command_line (GApplicationImpl  *impl,
                                  gchar            **arguments,
                                  GVariant          *platform_data)
 {
-  NSAutoReleasePool *pool;
+  NSAutoreleasePool *pool;
+  
+  id connection, commandLineObject;
   char *service_name;
   NSString *serviceName;
   BOOL res;
@@ -438,42 +488,45 @@ g_application_impl_command_line (GApplicationImpl  *impl,
   char **iter;
   GVariantObject *platformData;
   
-  pool = [NSAutoReleasePool new];
+  pool = [NSAutoreleasePool new];
+  
+  connection = [[NSConnection new] autorelease];
   
   service_name = g_strconcat (impl->appid, ".CommandLine", NULL);
-  serviceName = [[NSString stringWithCString:serviceName
-                                            :encoding:NSASCIIStringEncoding]
+  serviceName = [[NSString stringWithCString:service_name encoding:NSASCIIStringEncoding]
                  autorelease];
   g_free (service_name);
   
-  res = [impl->connection registerName:serviceName];
+  res = [connection registerName:serviceName];
   if (res != YES)
   {
     ret = 1;
     goto done;
   }
   
-  impl->commandLineObject = [[commandLineObject alloc] initWithApplicationImpl impl];
+  commandLineObject = [[commandLineObject alloc] initWithApplicationImpl:impl];
+  [commandLineObject autorelease];
   
-  [impl->connection setRootObject:impl->commandLineObject];
+  [connection setRootObject:commandLineObject];
+  [connection runInNewThread];
   
   argumentsArray = [NSMutableArray new];
   for (iter = arguments; *iter != NULL; iter++)
   {
-    [argumentsArray :addObject[NSData dataWithBytes:*iter length:strlen (*iter)]];
+    [argumentsArray addObject:[NSData dataWithBytes:*iter length:strlen (*iter)]];
   }
   
   platformData = [[GVariantObject alloc] initWithVariant:platform_data];
   
-  [impl->appObject commandLine:service_name arguments:argumentsArray
+  [impl->appObject commandLine:serviceName arguments:argumentsArray
                   platformData:platformData];
   
-  g_mutex_lock (impl->command_line_mutex);
+  g_mutex_lock (&impl->command_line_mutex);
   g_cond_wait (&impl->command_line_cond, &impl->command_line_mutex);
-  g_mutex_unlock (impl->command_line_mutex);
+  g_mutex_unlock (&impl->command_line_mutex);
   
   ret = impl->command_line_ret;
-
+  
 done:
   [pool drain];
   return ret;
@@ -521,19 +574,23 @@ static void
 g_osx_command_line_print_literal (GApplicationCommandLine *cmdline,
                                   const gchar             *message)
 {
+  GOSXCommandLine *gosxcl =  (GOSXCommandLine *)cmdline;
+  
   NSString *string = [[NSString string] initWithUTF8String:message];
   
-  [cmdline->commandLineObject print:string];
+  [gosxcl->commandLineObject print:string];
   [string release];
 }
 
 static void
 g_osx_command_line_printerr_literal (GApplicationCommandLine *cmdline,
-                                      const gchar             *message)
+                                     const gchar             *message)
 {
+  GOSXCommandLine *gosxcl =  (GOSXCommandLine *)cmdline;
+  
   NSString *string = [[NSString string] initWithUTF8String:message];
   
-  [cmdline->commandLineObject printError:string];
+  [gosxcl->commandLineObject printError:string];
   [string release];
 }
 
@@ -544,11 +601,11 @@ g_osx_command_line_finalize (GObject *object)
   GOSXCommandLine *gosxcl = (GOSXCommandLine *)object;
   gint status;
   
-  status = g_application_command_line_get_status (cmdline);
-  [gosxcl->commandLineObject setResult:status];
+  status = g_application_command_line_get_exit_status(cmdline);
+  [gosxcl->commandLineObject setExitStatus:status];
   
   [gosxcl->commandLineObject release];
-
+  
   G_OBJECT_CLASS (g_osx_command_line_parent_class)->finalize (object);
 }
 
@@ -568,20 +625,20 @@ g_osx_command_line_class_init (GApplicationCommandLineClass *class)
 }
 
 static GApplicationCommandLine *
-g_osx_command_line_new (NSString *service_name, NSArray *argumentsArray, GVariantObject platformData)
+g_osx_command_line_new (NSString *serviceName, NSArray *argumentsArray, GVariantObject *platformData)
 {
   NSUInteger n, i;
   char **arguments;
   GOSXCommandLine *gosxcl;
-
+  
   n = [argumentsArray count];
   arguments = g_new (char *, n + 1);
   for (i = 0; i < n; i++)
   {
     NSData *arg = [argumentsArray objectAtIndex:i];
     
-    arguments[i] = g_new [arg length];
-    g_memcpy (arguments[i], [arg bytes], [arg length]); 
+    arguments[i] = g_new (char, [arg length]);
+    memcpy (arguments[i], [arg bytes], [arg length]); 
   }
   arguments[n] = NULL;
   
@@ -590,7 +647,9 @@ g_osx_command_line_new (NSString *service_name, NSArray *argumentsArray, GVarian
                          "platform-data", [platformData variant],
                          NULL);
   
-  gosxcl->commandLineObject = [commandLineObject retain];
+  gosxcl->commandLineObject = [[NSConnection
+                               rootProxyForConnectionWithRegisteredName:serviceName
+                               host:nil] retain];
   
   return G_APPLICATION_COMMAND_LINE (gosxcl);
 }

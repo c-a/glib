@@ -185,7 +185,6 @@ application_sources = \
 	$(NULL)
 
 if OS_CARBON
-AM_CPPFLAGS += -xobjective-c
 application_sources += gapplicationimpl-osx.c
 else
 application_sources += gapplicationimpl-dbus.c
